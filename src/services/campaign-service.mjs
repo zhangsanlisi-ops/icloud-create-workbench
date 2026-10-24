@@ -1,0 +1,182 @@
+/** 创建持续生产目标与后台调度服务。 */
+export function createCampaignService({ config, repositories, icloudService }) {
+  let ticking = false;
+  let timer = null;
+
+  /** 计算账号下一次允许运行的时间。 */
+  function nextAllowedTime(account) {
+    const cooldown = new Date(account?.cooldown_until || 0).getTime();
+    return new Date(Math.max(Date.now(), Number.isFinite(cooldown) ? cooldown : 0)).toISOString();
+  }
+
+  /** 校验并标准化标签前缀。 */
+  function normalizeLabelPrefix(value) {
+    const labelPrefix = String(value || "").trim();
+    if (!/^[A-Za-z0-9_-]{1,24}$/.test(labelPrefix)) {
+      throw Object.assign(new Error("标签前缀只能包含字母、数字、下划线和短横线，最长 24 位"), { status: 400 });
+    }
+    return labelPrefix;
+  }
+
+  /** 从 Apple ID 生成符合标签规则的默认前缀。 */
+  function defaultLabelPrefix(appleId) {
+    return String(appleId || "").split("@")[0].replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 24) || "icloud";
+  }
+
+  /** 拒绝对不存在、已删除或已过期的 CK 创建/恢复任务。 */
+  function ensureCampaignAccountAvailable(account) {
+    if (!account || account.status === "deleted") {
+      throw Object.assign(new Error("CK 账号不存在"), { status: 404 });
+    }
+    if (account.status === "expired") {
+      throw Object.assign(new Error("CK 已过期，请先更新 CK"), { status: 409, accountExpired: true });
+    }
+  }
+
+  /** 区分 Apple 邮箱容量耗尽与短时限流，避免容量已满后持续重试。 */
+  function isAddressCapacityError(message) {
+    const text = String(message || "");
+    if (/(rate.?limit|too many requests|429|频繁|限流|冷却)/i.test(text)) return false;
+    return /(quota|capacity|maximum|max(?:imum)? number|too many|limit|上限|限额|容量已满|最多)/i.test(text)
+      && /(address|email|alias|hme|邮箱|地址)/i.test(text);
+  }
+
+  /** 创建默认目标为 750 的持续生产任务，超过旧阈值时先同步 Apple 库存。 */
+  async function createCampaign(input) {
+    const account = repositories.getAccountInternal(input.accountId);
+    ensureCampaignAccountAvailable(account);
+    if (repositories.findOpenCampaign(input.accountId)) {
+      throw Object.assign(new Error("该 CK 已有未完成的生产目标，请停止或继续现有任务"), { status: 409 });
+    }
+    const targetTotal = Number(input.targetTotal || config.targetDefault);
+    const batchSize = Number(input.batchSize || config.batchLimit);
+    const labelPrefix = normalizeLabelPrefix(input.labelPrefix || defaultLabelPrefix(account.apple_id));
+    if (!Number.isInteger(targetTotal) || targetTotal < 1 || targetTotal > 750) {
+      throw Object.assign(new Error("目标库存必须是 1-750 之间的整数"), { status: 400 });
+    }
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > config.batchLimit) {
+      throw Object.assign(new Error(`每批数量必须是 1-${config.batchLimit}`), { status: 400 });
+    }
+    if (targetTotal > 700) await icloudService.syncAddresses(input.accountId);
+    const currentTotal = repositories.countAddresses(input.accountId);
+    if (currentTotal >= targetTotal) {
+      throw Object.assign(new Error(`当前库存已达到 ${currentTotal}，无需创建该目标`), { status: 400 });
+    }
+    return repositories.createCampaign({
+      accountId: input.accountId,
+      targetTotal,
+      batchSize,
+      labelPrefix,
+      nextRunAt: nextAllowedTime(account)
+    });
+  }
+
+  /** 修改当前生产目标后续批次使用的标签前缀。 */
+  function updateLabelPrefix(id, input) {
+    const labelPrefix = normalizeLabelPrefix(input.labelPrefix);
+    if (!repositories.updateCampaignLabelPrefix(id, labelPrefix)) {
+      throw Object.assign(new Error("运行中或已停止的生产目标不存在"), { status: 404 });
+    }
+    return { ok: true, labelPrefix };
+  }
+
+  /** 删除生产目标并停止后续自动批次。 */
+  function deleteCampaign(id) {
+    const campaign = repositories.getCampaignInternal(id);
+    if (!campaign) throw Object.assign(new Error("生产目标不存在"), { status: 404 });
+    if (!repositories.deleteCampaign(id)) throw Object.assign(new Error("生产目标删除失败"), { status: 409 });
+    return { ok: true };
+  }
+
+  /** 停止目标的后续自动批次。 */
+  function stopCampaign(id) {
+    if (!repositories.stopCampaign(id)) throw Object.assign(new Error("运行中的生产目标不存在"), { status: 404 });
+    return { ok: true };
+  }
+
+  /** 继续一个已经停止的生产目标。 */
+  function resumeCampaign(id) {
+    const campaign = repositories.getCampaignInternal(id);
+    if (!campaign) throw Object.assign(new Error("生产目标不存在"), { status: 404 });
+    const account = repositories.getAccountInternal(campaign.account_id);
+    ensureCampaignAccountAvailable(account);
+    if (!repositories.resumeCampaign(id, nextAllowedTime(account))) {
+      throw Object.assign(new Error("该生产目标当前不能继续"), { status: 409 });
+    }
+    return { ok: true };
+  }
+
+  /** 执行单个到期生产目标的一批生成。 */
+  async function runCampaign(campaign) {
+    const currentTotal = repositories.countAddresses(campaign.account_id);
+    if (currentTotal >= campaign.target_total) return repositories.completeCampaign(campaign.id);
+    const requestedCount = Math.min(campaign.batch_size, campaign.target_total - currentTotal);
+    try {
+      const result = await icloudService.generate(campaign.account_id, requestedCount, campaign.label_prefix);
+      const generatedCount = result.generated.length;
+      const updatedTotal = repositories.countAddresses(campaign.account_id);
+      const account = repositories.getAccountInternal(campaign.account_id);
+      const complete = updatedTotal >= campaign.target_total;
+      const nextRunAt = complete ? null : generatedCount
+        ? nextAllowedTime(account)
+        : new Date(Date.now() + config.retryMinutes * 60_000).toISOString();
+      const lastError = result.errors.map(item => item.error).join("；");
+      const capacityReached = result.errors.some(item => isAddressCapacityError(item.error));
+      repositories.recordCampaignRun(campaign.id, generatedCount, capacityReached ? null : nextRunAt, lastError);
+      if (complete) repositories.completeCampaign(campaign.id);
+      else if (capacityReached) repositories.stopCampaign(campaign.id);
+    } catch (error) {
+      if (error.status === 404) return repositories.stopCampaign(campaign.id);
+      if (error.accountExpired || error.status === 410) {
+        repositories.recordCampaignRun(campaign.id, 0, null, error.message);
+        repositories.stopCampaign(campaign.id);
+        return;
+      }
+      if (isAddressCapacityError(error.message)) {
+        repositories.recordCampaignRun(campaign.id, 0, null, error.message);
+        repositories.stopCampaign(campaign.id);
+        return;
+      }
+      const nextRunAt = error.cooldownUntil || new Date(Date.now() + config.retryMinutes * 60_000).toISOString();
+      repositories.recordCampaignRun(campaign.id, 0, nextRunAt, error.message);
+    }
+  }
+
+  /** 扫描并执行当前到期的生产目标。 */
+  async function tick() {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const due = repositories.listDueCampaigns(new Date().toISOString());
+      for (const campaign of due) await runCampaign(campaign);
+    } finally {
+      ticking = false;
+    }
+  }
+
+  /** 启动五秒一次的轻量后台调度循环。 */
+  function start() {
+    if (timer) return;
+    timer = setInterval(() => tick().catch(error => console.error(`生产任务调度失败：${error.message}`)), 5000);
+    timer.unref();
+    void tick();
+  }
+
+  /** 停止后台调度循环。 */
+  function close() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  return {
+    createCampaign,
+    updateLabelPrefix,
+    deleteCampaign,
+    stopCampaign,
+    resumeCampaign,
+    listCampaigns: limit => repositories.listCampaigns(limit),
+    wake: tick,
+    start,
+    close
+  };
+}

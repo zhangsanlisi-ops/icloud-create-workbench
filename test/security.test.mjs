@@ -1,0 +1,22 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { decryptSecret, encryptSecret, hashPassword, verifyPassword, verifyPlainPassword } from "../src/security.mjs";
+
+test("环境变量中的明文密码可以验证正确密码并拒绝错误密码", () => {
+  assert.equal(verifyPlainPassword("a-very-strong-password", "a-very-strong-password"), true);
+  assert.equal(verifyPlainPassword("wrong-password", "a-very-strong-password"), false);
+});
+
+test("scrypt 密码哈希可以验证正确密码并拒绝错误密码", () => {
+  const hash = hashPassword("a-very-strong-password");
+  assert.equal(verifyPassword("a-very-strong-password", hash), true);
+  assert.equal(verifyPassword("wrong-password", hash), false);
+});
+
+test("AES-256-GCM 可以解密原文并拒绝篡改密文", () => {
+  const key = randomBytes(32).toString("base64");
+  const encrypted = encryptSecret("X-APPLE-SECRET=value", key);
+  assert.equal(decryptSecret(encrypted, key), "X-APPLE-SECRET=value");
+  assert.throws(() => decryptSecret(`${encrypted.slice(0, -2)}AA`, key));
+});
